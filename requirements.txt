@@ -3,3 +3,4 @@ requests
 pycryptodome
 flask
 flask_cors
+gunicorn
