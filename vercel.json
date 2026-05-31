@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/ban.py": {
+      "runtime": "python3.9"
+    }
+  }
+}
