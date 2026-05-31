@@ -11,6 +11,256 @@ urllib3.disable_warnings()
 
 app = Flask(__name__)
 
+# ====================== THÊM LOGGING ======================
+import logging
+import sys
+
+# Cấu hình logging chi tiết
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/tmp/ban_api_debug.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# ====================== SỬA HÀM fetch_majorlogin_jwt CÓ DEBUG ======================
+def fetch_majorlogin_jwt(token):
+    logger.info(f"===== START fetch_majorlogin_jwt =====")
+    logger.info(f"Token input: {token[:50]}..." if len(token) > 50 else f"Token input: {token}")
+    logger.info(f"Token length: {len(token)}")
+    logger.info(f"Token starts with 'eyJ': {token.startswith('eyJ')}")
+    logger.info(f"Token contains '.' : {'.' in token}")
+    
+    token = token.strip()
+    
+    # TRƯỜNG HỢP 1: ĐÃ LÀ JWT
+    if token.startswith("eyJ") and token.count('.') == 2:
+        logger.info("Case 1: Token looks like JWT")
+        try:
+            decoded = decode_jwt(token)
+            logger.info(f"Decoded JWT: {json.dumps(decoded, default=str)[:200]}")
+            if decoded.get('account_id'):
+                logger.info("JWT valid, returning directly")
+                return token, decoded, None
+            else:
+                logger.warning("JWT decoded but no account_id")
+        except Exception as e:
+            logger.error(f"Error decoding JWT: {str(e)}")
+    
+    # TRƯỜNG HỢP 2: ACCESS TOKEN - CONVERT QUA API
+    logger.info("Case 2: Trying to convert via jwt-caidb API")
+    try:
+        convert_url = f"https://jwt-caidb.vercel.app/convert/{token}"
+        logger.info(f"Calling: {convert_url}")
+        resp = requests.get(convert_url, timeout=10)
+        logger.info(f"Response status: {resp.status_code}")
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(f"API response: {json.dumps(data, default=str)[:300]}")
+            
+            if data.get('success') and data.get('jwt_token'):
+                jwt_token = data['jwt_token']
+                decoded = data.get('decoded', {})
+                logger.info(f"Convert success! JWT: {jwt_token[:50]}...")
+                logger.info(f"Decoded: {json.dumps(decoded, default=str)[:200]}")
+                return jwt_token, decoded, None
+            else:
+                logger.warning(f"API returned success=False: {data.get('error', 'unknown')}")
+        else:
+            logger.error(f"API returned status {resp.status_code}")
+    except Exception as e:
+        logger.error(f"Error calling convert API: {str(e)}")
+    
+    # TRƯỜNG HỢP 3: EXTRACT OPEN_ID
+    logger.info("Case 3: Trying to extract Open ID from token")
+    oId = None
+    
+    # Cách 1: API inspect Garena
+    try:
+        logger.info("Trying Garena OAuth inspect API...")
+        r = requests.get(
+            f"https://100067.connect.garena.com/oauth/token/inspect?token={token}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5
+        )
+        logger.info(f"Inspect API status: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            logger.info(f"Inspect response: {json.dumps(data, default=str)[:200]}")
+            oId = data.get("open_id")
+            logger.info(f"Extracted open_id: {oId}")
+    except Exception as e:
+        logger.error(f"Error calling inspect API: {str(e)}")
+    
+    # Cách 2: API reward
+    if not oId:
+        try:
+            logger.info("Trying Reward API...")
+            headers = {"access-token": token, "user-agent": "Mozilla/5.0"}
+            uid_res = requests.get(
+                "https://prod-api.reward.ff.garena.com/redemption/api/auth/inspect_token/",
+                headers=headers,
+                verify=False,
+                timeout=5
+            )
+            logger.info(f"Reward API status: {uid_res.status_code}")
+            
+            if uid_res.status_code == 200:
+                uid_data = uid_res.json()
+                logger.info(f"Reward response: {json.dumps(uid_data, default=str)[:200]}")
+                uid = uid_data.get("uid")
+                
+                if uid:
+                    logger.info(f"Extracted UID: {uid}")
+                    openid_res = requests.post(
+                        "https://topup.pk/api/auth/player_id_login",
+                        headers={"Content-Type": "application/json"},
+                        json={"app_id": 100067, "login_id": str(uid)},
+                        verify=False,
+                        timeout=5
+                    )
+                    logger.info(f"Topup API status: {openid_res.status_code}")
+                    
+                    if openid_res.status_code == 200:
+                        openid_data = openid_res.json()
+                        logger.info(f"Topup response: {json.dumps(openid_data, default=str)[:200]}")
+                        oId = openid_data.get("open_id")
+                        logger.info(f"Extracted open_id: {oId}")
+        except Exception as e:
+            logger.error(f"Error in reward/topup flow: {str(e)}")
+    
+    if not oId:
+        logger.error("FAILED: Cannot extract Open ID from token")
+        return None, None, "Cannot extract Open ID from token. Token may be invalid or expired."
+    
+    logger.info(f"Open ID extracted successfully: {oId}")
+    
+    # TRƯỜNG HỢP 4: MajorLogin
+    logger.info("Case 4: Trying MajorLogin with platforms...")
+    platforms = [8, 3, 4, 6]
+    
+    for p_type in platforms:
+        logger.info(f"Trying platform {p_type}...")
+        try:
+            pl = build_majorlogin(token, oId, p_type)
+            logger.info(f"MajorLogin payload built, size: {len(pl)} bytes")
+            
+            x = requests.post(mLuRl, headers=mLhDr, data=pl, timeout=10, verify=False)
+            logger.info(f"MajorLogin response status: {x.status_code}")
+            logger.info(f"Response size: {len(x.content)} bytes")
+            
+            if x.status_code == 200:
+                # Thử decrypt
+                try:
+                    decrypted = dec(x.content)
+                    hex_data = decrypted.hex()
+                    logger.info(f"Decrypted successfully, hex length: {len(hex_data)}")
+                except Exception as e:
+                    logger.error(f"Decrypt failed: {str(e)}")
+                    hex_data = x.content.hex()
+                    logger.info(f"Raw hex length: {len(hex_data)}")
+                
+                parsed = get_available_room(hex_data)
+                logger.info(f"Parsed fields: {list(parsed.keys())}")
+                
+                # Tìm JWT
+                for key, value in parsed.items():
+                    data_val = value.get('data', '')
+                    logger.info(f"Field {key}: type={type(data_val)}, len={len(str(data_val))}")
+                    
+                    if isinstance(data_val, str) and len(data_val) > 50:
+                        if data_val.startswith("eyJ") or ('.' in data_val and len(data_val.split('.')) == 3):
+                            logger.info(f"Found JWT in field {key}!")
+                            logger.info(f"JWT: {data_val[:100]}...")
+                            return data_val, decode_jwt(data_val), None
+                
+                logger.warning(f"No JWT found in response for platform {p_type}")
+            else:
+                logger.warning(f"MajorLogin failed with status {x.status_code}")
+        except Exception as e:
+            logger.error(f"Error in MajorLogin platform {p_type}: {str(e)}")
+    
+    logger.error("FAILED: All MajorLogin platforms failed")
+    return None, None, "MajorLogin failed. Account may be blocked."
+
+
+# ====================== THÊM ENDPOINT DEBUG ======================
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Endpoint debug để kiểm tra token"""
+    token = request.args.get('token', '')
+    
+    if not token:
+        return jsonify({
+            'status': 'error',
+            'message': 'Missing token parameter',
+            'usage': '/debug?token=your_token_here'
+        })
+    
+    result = {
+        'token_input': token[:50] + '...' if len(token) > 50 else token,
+        'token_length': len(token),
+        'token_starts_eyJ': token.startswith('eyJ'),
+        'token_dot_count': token.count('.'),
+        'debug_logs': []
+    }
+    
+    # Test JWT decode trực tiếp
+    if token.startswith('eyJ') and token.count('.') == 2:
+        try:
+            decoded = decode_jwt(token)
+            result['jwt_decode_success'] = True
+            result['jwt_payload'] = decoded
+            result['expired'] = decoded.get('exp', 0) < time.time() if decoded.get('exp') else 'unknown'
+        except Exception as e:
+            result['jwt_decode_success'] = False
+            result['jwt_decode_error'] = str(e)
+    
+    # Test convert API
+    try:
+        convert_url = f"https://jwt-caidb.vercel.app/convert/{token}"
+        resp = requests.get(convert_url, timeout=10)
+        result['convert_api_status'] = resp.status_code
+        if resp.status_code == 200:
+            result['convert_api_response'] = resp.json()
+    except Exception as e:
+        result['convert_api_error'] = str(e)
+    
+    return jsonify(result)
+
+
+# ====================== THÊM ENDPOINT XEM LOG ======================
+@app.route('/log', methods=['GET'])
+def view_log():
+    """Xem log debug (chỉ hoạt động trên Render)"""
+    try:
+        if os.path.exists('/tmp/ban_api_debug.log'):
+            with open('/tmp/ban_api_debug.log', 'r') as f:
+                logs = f.read().split('\n')[-100:]  # 100 dòng cuối
+            return jsonify({
+                'success': True,
+                'logs': '\n'.join(logs)
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Log file not found'
+            })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })
+
+
+# ====================== THÊM IMPORT os ======================
+import os
+
 # ====================== CONSTANTS (giữ nguyên từ ban.py) ======================
 API_URL = 'https://clientbp.ggpolarbear.com/GetLoginData'
 BODY_BASE64 = (
